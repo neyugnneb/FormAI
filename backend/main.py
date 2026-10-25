@@ -36,7 +36,8 @@ app.add_middleware(
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_VIDEO_SECONDS = 120
 ANNOTATED_VIDEO_TTL_SECONDS = 15 * 60
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_MAX_ATTEMPTS = 3
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 ALLOWED_EXTENSIONS = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
 POSE_CONNECTIONS = (
     ("left_shoulder", "right_shoulder"),
@@ -333,7 +334,304 @@ def calculate_shot_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def get_coaching_feedback(metrics: dict[str, Any]) -> dict[str, Any]:
+def calculate_golf_putt_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    detected_samples = [
+        sample
+        for sample in samples
+        if sample.get("left") is not None or sample.get("right") is not None
+    ]
+    if not detected_samples:
+        raise HTTPException(
+            status_code=422,
+            detail="No golfer was detected. Use a clear, full-body video from the side.",
+        )
+
+    first_timestamp = detected_samples[0]["timestamp_seconds"]
+    setup_samples = [
+        sample
+        for sample in detected_samples
+        if sample["timestamp_seconds"] <= first_timestamp + 1.0
+    ]
+
+    def joint_center(sample: dict[str, Any], joint: str) -> tuple[float, float] | None:
+        points = [
+            sample[side][joint]
+            for side in ("left", "right")
+            if sample.get(side) and joint in sample[side]
+        ]
+        if not points:
+            return None
+        return (
+            statistics.mean(point[0] for point in points),
+            statistics.mean(point[1] for point in points),
+        )
+
+    spine_tilts: list[float] = []
+    knee_flexions: list[float] = []
+    elbow_angles: list[float] = []
+    for sample in setup_samples:
+        shoulder = joint_center(sample, "shoulder")
+        hip = joint_center(sample, "hip")
+        if shoulder is not None and hip is not None:
+            vertical_distance = abs(hip[1] - shoulder[1])
+            if vertical_distance > 0:
+                spine_tilts.append(
+                    math.degrees(
+                        math.atan2(abs(shoulder[0] - hip[0]), vertical_distance)
+                    )
+                )
+
+        for side in ("left", "right"):
+            joints = sample.get(side)
+            if not joints:
+                continue
+            if all(name in joints for name in ("hip", "knee", "ankle")):
+                if (
+                    math.dist(joints["hip"], joints["knee"]) > 0
+                    and math.dist(joints["ankle"], joints["knee"]) > 0
+                ):
+                    knee_flexions.append(
+                        180
+                        - calculate_angle(
+                            joints["hip"], joints["knee"], joints["ankle"]
+                        )
+                    )
+            if all(name in joints for name in ("shoulder", "elbow", "wrist")):
+                if (
+                    math.dist(joints["shoulder"], joints["elbow"]) > 0
+                    and math.dist(joints["wrist"], joints["elbow"]) > 0
+                ):
+                    elbow_angles.append(
+                        calculate_angle(
+                            joints["shoulder"], joints["elbow"], joints["wrist"]
+                        )
+                    )
+
+    shoulder_widths = [
+        math.dist(sample["left"]["shoulder"], sample["right"]["shoulder"])
+        for sample in detected_samples
+        if sample.get("left")
+        and sample.get("right")
+        and "shoulder" in sample["left"]
+        and "shoulder" in sample["right"]
+        and math.dist(sample["left"]["shoulder"], sample["right"]["shoulder"]) > 0
+    ]
+    body_scales = shoulder_widths or [
+        math.dist(sample[side]["shoulder"], sample[side]["hip"])
+        for sample in detected_samples
+        for side in ("left", "right")
+        if sample.get(side)
+        and "shoulder" in sample[side]
+        and "hip" in sample[side]
+        and math.dist(sample[side]["shoulder"], sample[side]["hip"]) > 0
+    ]
+    body_scale = statistics.median(body_scales) if body_scales else None
+
+    wrist_centers = [
+        center
+        for sample in detected_samples
+        if (center := joint_center(sample, "wrist")) is not None
+    ]
+    wrist_path_range = None
+    if wrist_centers and body_scale:
+        wrist_path_range = round(
+            math.hypot(
+                max(point[0] for point in wrist_centers)
+                - min(point[0] for point in wrist_centers),
+                max(point[1] for point in wrist_centers)
+                - min(point[1] for point in wrist_centers),
+            )
+            / body_scale,
+            2,
+        )
+
+    shoulder_centers = [
+        center
+        for sample in detected_samples
+        if (center := joint_center(sample, "shoulder")) is not None
+    ]
+    shoulder_movement = None
+    if shoulder_centers and body_scale:
+        reference = (
+            statistics.median(point[0] for point in shoulder_centers),
+            statistics.median(point[1] for point in shoulder_centers),
+        )
+        shoulder_movement = round(
+            max(math.dist(point, reference) for point in shoulder_centers)
+            / body_scale,
+            2,
+        )
+
+    return {
+        "analysis_type": "golf_putt",
+        "setup_spine_tilt_degrees": (
+            round(statistics.median(spine_tilts), 1) if spine_tilts else None
+        ),
+        "setup_knee_flexion_degrees": (
+            round(statistics.median(knee_flexions), 1) if knee_flexions else None
+        ),
+        "setup_elbow_angle_degrees": (
+            round(statistics.median(elbow_angles), 1) if elbow_angles else None
+        ),
+        "wrist_path_range_body_scale": wrist_path_range,
+        "shoulder_movement_body_scale": shoulder_movement,
+        "frames_with_pose": len(detected_samples),
+        "measurement_notes": [
+            "These are approximate 2D body-pose proxies, not validated putting measurements.",
+            "Setup posture uses the first second of the clip; begin recording once you are standing at address.",
+            "Wrist path and shoulder movement cover the entire clip and can be affected by walking, camera angle, and framing.",
+            "The pose model does not track the putter, ball, club-face alignment, impact, ball start line, or putt distance.",
+            "Use a steady side view with the golfer's full body visible. The composite score is an illustrative comparison against broad setup ranges, not a measure of putting performance.",
+        ],
+    }
+
+
+def calculate_overhead_action_metrics(
+    samples: list[dict[str, Any]], sport: str
+) -> dict[str, Any]:
+    detected_samples = [
+        sample
+        for sample in samples
+        if sample.get("left") is not None or sample.get("right") is not None
+    ]
+    if not detected_samples:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No athlete was detected. Use a clear, full-body {sport.lower()} video.",
+        )
+
+    arm_candidates: list[tuple[float, str, int, dict[str, Any]]] = []
+    for side in ("left", "right"):
+        candidates = [
+            (index, sample[side])
+            for index, sample in enumerate(samples)
+            if sample.get(side)
+            and all(name in sample[side] for name in ("shoulder", "elbow", "wrist"))
+        ]
+        if candidates:
+            peak_index, peak_arm = max(
+                candidates,
+                key=lambda candidate: candidate[1]["shoulder"][1]
+                - candidate[1]["wrist"][1],
+            )
+            arm_candidates.append(
+                (
+                    peak_arm["shoulder"][1] - peak_arm["wrist"][1],
+                    side,
+                    peak_index,
+                    peak_arm,
+                )
+            )
+    if not arm_candidates:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not track an arm. Keep the athlete's shoulder, elbow, and wrist visible.",
+        )
+
+    _, active_arm, peak_index, peak_arm = max(arm_candidates, key=lambda item: item[0])
+    elbow_angle = calculate_angle(
+        peak_arm["shoulder"], peak_arm["elbow"], peak_arm["wrist"]
+    )
+    shoulder_to_wrist = (
+        peak_arm["wrist"][0] - peak_arm["shoulder"][0],
+        peak_arm["shoulder"][1] - peak_arm["wrist"][1],
+    )
+    arm_elevation = math.degrees(
+        math.atan2(abs(shoulder_to_wrist[1]), abs(shoulder_to_wrist[0]))
+    )
+
+    def center(sample: dict[str, Any], joint: str) -> tuple[float, float] | None:
+        points = [
+            sample[side][joint]
+            for side in ("left", "right")
+            if sample.get(side) and joint in sample[side]
+        ]
+        if not points:
+            return None
+        return (
+            statistics.mean(point[0] for point in points),
+            statistics.mean(point[1] for point in points),
+        )
+
+    shoulder_widths = [
+        math.dist(sample["left"]["shoulder"], sample["right"]["shoulder"])
+        for sample in detected_samples
+        if sample.get("left")
+        and sample.get("right")
+        and "shoulder" in sample["left"]
+        and "shoulder" in sample["right"]
+        and math.dist(sample["left"]["shoulder"], sample["right"]["shoulder"]) > 0
+    ]
+    body_scale = statistics.median(shoulder_widths) if shoulder_widths else None
+
+    torso_lean: float | None = None
+    shoulders = center(samples[peak_index], "shoulder")
+    hips = center(samples[peak_index], "hip")
+    if shoulders is not None and hips is not None:
+        vertical_distance = abs(hips[1] - shoulders[1])
+        if vertical_distance > 0:
+            torso_lean = round(
+                math.degrees(
+                    math.atan2(abs(shoulders[0] - hips[0]), vertical_distance)
+                ),
+                1,
+            )
+
+    hip_centers = [
+        hip_center
+        for sample in detected_samples
+        if (hip_center := center(sample, "hip")) is not None
+    ]
+    hip_displacement: float | None = None
+    if len(hip_centers) > 1 and body_scale:
+        initial_hip = hip_centers[0]
+        hip_displacement = round(
+            max(math.dist(initial_hip, hip) for hip in hip_centers) / body_scale,
+            2,
+        )
+
+    knee_flexions = [
+        180
+        - calculate_angle(
+            sample[side]["hip"],
+            sample[side]["knee"],
+            sample[side]["ankle"],
+        )
+        for sample in detected_samples
+        for side in ("left", "right")
+        if sample.get(side)
+        and all(name in sample[side] for name in ("hip", "knee", "ankle"))
+        and math.dist(sample[side]["hip"], sample[side]["knee"]) > 0
+        and math.dist(sample[side]["ankle"], sample[side]["knee"]) > 0
+    ]
+    knee_flexion_range = (
+        round(max(knee_flexions) - min(knee_flexions), 1)
+        if len(knee_flexions) > 1
+        else None
+    )
+
+    return {
+        "analysis_type": "overhead_action",
+        "active_arm": active_arm,
+        "elbow_angle_at_highest_wrist_degrees": round(elbow_angle, 1),
+        "arm_elevation_at_highest_wrist_degrees": round(arm_elevation, 1),
+        "torso_lean_at_highest_wrist_degrees": torso_lean,
+        "knee_flexion_range_degrees": knee_flexion_range,
+        "hip_displacement_body_widths": hip_displacement,
+        "frames_with_pose": len(detected_samples),
+        "measurement_notes": [
+            "These values are approximate 2D pose proxies, not validated measures of serve or pitching performance.",
+            "The highest detected wrist position is not confirmed ball contact, release, or the most important phase of the motion.",
+            "The pose model does not track the ball, racket, or throwing arm implement; it cannot measure ball speed, spin, contact point, accuracy, or trajectory.",
+            "Hip displacement and joint angles depend on camera angle, framing, landmark visibility, and the full movement staying in view.",
+            "The composite score compares broad pose proxies only. It is not a measure of serve or pitch quality, and optimal mechanics vary by athlete and sport.",
+        ],
+    }
+
+
+def get_coaching_feedback(
+    metrics: dict[str, Any], sport: str = "Basketball"
+) -> dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(
@@ -343,9 +641,57 @@ def get_coaching_feedback(metrics: dict[str, Any]) -> dict[str, Any]:
 
     try:
         with genai.Client(api_key=api_key) as client:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=(
+            if sport == "Golf":
+                request_contents = (
+                    "Give brief, constructive golf putting setup and stroke "
+                    "feedback based only on the supplied approximate pose "
+                    "proxies: setup spine tilt, knee flexion, elbow angle, "
+                    "wrist path range, and shoulder movement. Return one short "
+                    "summary, at most two strengths, and at most three "
+                    "improvements with concise practice drills. Do not state "
+                    "that a putt was made or infer ball, putter, club-face, "
+                    "impact, start-line, distance, or head movement because "
+                    "these are not tracked. Treat broad posture ranges as "
+                    "illustrative, not universal coaching standards. "
+                    "Use these measurements:\n"
+                    f"{json.dumps(metrics)}"
+                )
+                system_instruction = (
+                    "You are a careful golf putting coach. Use only the supplied "
+                    "body-pose measurements. Do not claim to have seen the ball "
+                    "or putter, measured impact or ball roll, or assessed "
+                    "face/path alignment. State uncertainty where relevant. "
+                    "Offer practical, safe drills and avoid diagnosing injuries."
+                )
+            elif sport in ("Tennis", "Volleyball", "Baseball"):
+                action = {
+                    "Tennis": "tennis serve",
+                    "Volleyball": "volleyball serve",
+                    "Baseball": "baseball pitch",
+                }[sport]
+                request_contents = (
+                    f"Give brief, constructive {action} feedback using only "
+                    "the supplied approximate body-pose metrics: elbow angle "
+                    "and arm elevation at the highest detected wrist position, "
+                    "torso lean at that frame, knee-flexion range, and hip "
+                    "displacement. Return one short summary, at most two "
+                    "strengths, and at most three improvements with concise "
+                    "practice drills. Do not claim to identify ball contact, "
+                    "release, speed, spin, accuracy, or trajectory. Treat the "
+                    "highest-wrist frame as a pose reference, not a confirmed "
+                    "sport event. Avoid presenting a single ideal technique "
+                    "for every athlete. Use these measurements:\n"
+                    f"{json.dumps(metrics)}"
+                )
+                system_instruction = (
+                    f"You are a careful {action} coach. Use only the supplied "
+                    "pose measurements. Do not claim to see or track the ball, "
+                    "racket, or implement, or infer speed, spin, accuracy, "
+                    "contact, or release. State uncertainty where relevant. "
+                    "Offer practical, safe drills and do not diagnose injuries."
+                )
+            else:
+                request_contents = (
                     "Give brief, constructive basketball shot-form feedback based "
                     "on the measurable mechanics in the supplied data: stance "
                     "width, knee bend and extension, lower-to-upper-body timing, "
@@ -360,47 +706,79 @@ def get_coaching_feedback(metrics: dict[str, Any]) -> dict[str, Any]:
                     "because those events are not measured. "
                     "Use these measurements:\n"
                     f"{json.dumps(metrics)}"
-                ),
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=(
-                        "You are a careful basketball shooting-form coach. Use only "
-                        "the supplied pose metrics. Do not claim to have seen the "
-                        "video or tracked the ball. The wrist release angle is only "
-                        "a rough proxy, not the ball's launch angle. The measured "
-                        "elbow angle is not confirmed to be at set point or release. "
-                        "Avoid declaring a single ideal form for every player. Give practical, safe "
-                        "training drills; state when a metric is uncertain. Do not "
-                        "diagnose injuries."
-                    ),
-                    response_mime_type="application/json",
-                    max_output_tokens=1024,
-                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-                    response_schema={
-                        "type": "object",
-                        "properties": {
-                            "summary": {"type": "string"},
-                            "strengths": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                            "improvements": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "aspect": {"type": "string"},
-                                        "observation": {"type": "string"},
-                                        "drill": {"type": "string"},
-                                    },
-                                    "required": ["aspect", "observation", "drill"],
+                )
+                system_instruction = (
+                    "You are a careful basketball shooting-form coach. Use only "
+                    "the supplied pose metrics. Do not claim to have seen the "
+                    "video or tracked the ball. The wrist release angle is only "
+                    "a rough proxy, not the ball's launch angle. The measured "
+                    "elbow angle is not confirmed to be at set point or release. "
+                    "Avoid declaring a single ideal form for every player. Give practical, safe "
+                    "training drills; state when a metric is uncertain. Do not "
+                    "diagnose injuries."
+                )
+            request_config = genai_types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                max_output_tokens=1024,
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "strengths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "improvements": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "aspect": {"type": "string"},
+                                    "observation": {"type": "string"},
+                                    "drill": {"type": "string"},
                                 },
+                                "required": ["aspect", "observation", "drill"],
                             },
                         },
-                        "required": ["summary", "strengths", "improvements"],
                     },
-                ),
+                    "required": ["summary", "strengths", "improvements"],
+                },
             )
+            for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+                try:
+                    response = client.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=request_contents,
+                        config=request_config,
+                    )
+                    break
+                except genai_errors.ServerError as error:
+                    if (
+                        error.code not in (502, 503, 504)
+                        or attempt == GEMINI_MAX_ATTEMPTS
+                    ):
+                        raise
+                    delay_seconds = 2 ** (attempt - 1)
+                    logger.warning(
+                        "Gemini server error for model %s: HTTP %s (%s); "
+                        "retrying attempt %s of %s in %s seconds",
+                        GEMINI_MODEL,
+                        error.code,
+                        error.status,
+                        attempt + 1,
+                        GEMINI_MAX_ATTEMPTS,
+                        delay_seconds,
+                    )
+                    time.sleep(delay_seconds)
     except genai_errors.ClientError as error:
+        logger.warning(
+            "Gemini rejected request for model %s: HTTP %s (%s): %s",
+            GEMINI_MODEL,
+            error.code,
+            error.status,
+            error.message,
+        )
         if error.code in (401, 403):
             detail = (
                 "Gemini rejected the API key. Check GEMINI_API_KEY and ensure "
@@ -408,12 +786,18 @@ def get_coaching_feedback(metrics: dict[str, Any]) -> dict[str, Any]:
             )
         elif error.code == 429:
             detail = "Gemini quota or rate limit reached. Check your Google AI Studio usage and billing."
+        elif error.code == 400:
+            detail = (
+                "Gemini rejected the request: "
+                f"{error.message or 'invalid model or request configuration'}"
+            )
         else:
             detail = f"Gemini rejected the request (HTTP {error.code}). Check the Gemini model and API key configuration."
         raise HTTPException(status_code=502, detail=detail) from error
     except genai_errors.ServerError as error:
         logger.warning(
-            "Gemini server error for model %s: HTTP %s (%s)",
+            "Gemini server error after %s attempts for model %s: HTTP %s (%s)",
+            GEMINI_MAX_ATTEMPTS,
             GEMINI_MODEL,
             error.code,
             error.status,
@@ -503,7 +887,9 @@ def get_coaching_feedback(metrics: dict[str, Any]) -> dict[str, Any]:
     return feedback
 
 
-def render_pose_video(video_path: Path, output_path: Path) -> dict[str, Any]:
+def render_pose_video(
+    video_path: Path, output_path: Path, sport: str
+) -> dict[str, Any]:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise HTTPException(status_code=400, detail="Could not read this video.")
@@ -623,6 +1009,10 @@ def render_pose_video(video_path: Path, output_path: Path) -> dict[str, Any]:
         capture.release()
         if writer is not None:
             writer.release()
+    if sport == "Golf":
+        return calculate_golf_putt_metrics(pose_samples)
+    if sport in ("Tennis", "Volleyball", "Baseball"):
+        return calculate_overhead_action_metrics(pose_samples, sport)
     return calculate_shot_metrics(pose_samples)
 
 
@@ -634,10 +1024,10 @@ def mp_pose_name(index: int) -> str:
 def detect_pose(
     video: UploadFile = File(...), sport: str = Form(...)
 ) -> dict[str, Any]:
-    if sport != "Basketball":
+    if sport not in ("Basketball", "Golf", "Tennis", "Volleyball", "Baseball"):
         raise HTTPException(
             status_code=422,
-            detail="Basketball shot-form analysis is currently available for Basketball only.",
+            detail="Video analysis is currently available for Basketball, Golf putting, Tennis serves, Volleyball serves, and Baseball pitches.",
         )
     if not os.getenv("GEMINI_API_KEY"):
         raise HTTPException(
@@ -673,8 +1063,8 @@ def detect_pose(
                 output_path = Path(output_file.name)
 
             try:
-                metrics = render_pose_video(video_path, output_path)
-                feedback = get_coaching_feedback(metrics)
+                metrics = render_pose_video(video_path, output_path, sport)
+                feedback = get_coaching_feedback(metrics, sport)
             except Exception:
                 output_path.unlink(missing_ok=True)
                 raise
@@ -687,6 +1077,7 @@ def detect_pose(
                     time.monotonic() + ANNOTATED_VIDEO_TTL_SECONDS,
                 )
             return {
+                "sport": sport,
                 "metrics": metrics,
                 "feedback": feedback,
                 "video_url": f"/api/pose/video/{video_id}",
