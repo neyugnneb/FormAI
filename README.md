@@ -1,34 +1,4 @@
 # FormAI
-
-## Save shot analyses to Supabase
-
-Run the SQL in
-[`supabase/migrations/20261024201100_create_shot_analyses.sql`](./supabase/migrations/20261024201100_create_shot_analyses.sql)
-and then
-[`supabase/migrations/20261024201600_add_shot_target_match_score.sql`](./supabase/migrations/20261024201600_add_shot_target_match_score.sql)
-in the Supabase Dashboard SQL Editor, in order. For golf putting, tennis,
-volleyball, and baseball analyses, also run
-[`supabase/migrations/20261024230000_add_golf_putting_analysis.sql`](./supabase/migrations/20261024230000_add_golf_putting_analysis.sql)
-and
-[`supabase/migrations/20261024231900_add_overhead_action_score_version.sql`](./supabase/migrations/20261024231900_add_overhead_action_score_version.sql)
-in order. The migrations create one `shot_analyses` row per analysis, store
-pose-derived proxy values and coaching feedback, and restrict each
-authenticated user to their own rows with row-level security. Sport-specific
-metrics are stored in `sport_metrics`; video files are not stored in this table.
-
-The analysis page saves results only when a user is logged in. It displays and
-saves a target-match percentage based on the available knee dip angle, knee
-extension range, wrist peak timing after knee extension, elbow angle at peak
-wrist height, and wrist height relative to upper-arm length. These broad
-comparisons are equally weighted; values inside a target range receive 100%,
-and values outside lose points linearly with distance, reaching 0% one full
-target-range width beyond the range. Missing measurements are omitted and the
-remaining components are averaged. This is a versioned, illustrative target
-match—not a validated shooting-quality score. Golf, tennis, volleyball, and
-baseball use separate versioned proxy comparisons; these are illustrative
-tracking aids, not validated performance scores. Camera- and clip-dependent
-proxies and ball/club events the app cannot detect are excluded.
-
 ## Supabase authentication
 
 The `/auth` page supports email/password sign-up and login. Copy
